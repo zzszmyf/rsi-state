@@ -72,6 +72,8 @@ type Candidate struct {
 	Status        CandidateStatus `json:"status"`
 	CreatedAt     time.Time       `json:"created_at"`
 	AcceptedAt    *time.Time      `json:"accepted_at,omitempty"`
+	RejectedAt    *time.Time      `json:"rejected_at,omitempty"`
+	RejectReason  string          `json:"reject_reason,omitempty"`
 }
 
 type CandidateInput struct {
@@ -126,6 +128,21 @@ func (s *Service) CreateCandidate(_ context.Context, input CandidateInput) (Cand
 
 func (s *Service) GetCandidate(_ context.Context, candidateID string) (Candidate, error) {
 	return s.store.getCandidate(candidateID)
+}
+
+func (s *Service) GetHead(_ context.Context, workspaceID string) (AcceptedHead, error) {
+	return s.store.getHead(workspaceID)
+}
+
+func (s *Service) RejectCandidate(_ context.Context, candidateID, reason string) (Candidate, error) {
+	if strings.TrimSpace(reason) == "" {
+		return Candidate{}, fmt.Errorf("%w: rejection reason is required", ErrInvalidInput)
+	}
+	return s.store.rejectCandidate(candidateID, reason, s.now().UTC())
+}
+
+func (s *Service) CollectRejectedBefore(_ context.Context, cutoff time.Time) int {
+	return s.store.collectRejectedBefore(cutoff.UTC())
 }
 
 // PromoteCandidate performs the accepted-head compare-and-swap. The candidate
@@ -242,6 +259,45 @@ func (s *InMemoryStore) getCandidate(candidateID string) (Candidate, error) {
 	return copyCandidate(candidate), nil
 }
 
+func (s *InMemoryStore) getHead(workspaceID string) (AcceptedHead, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	workspace, ok := s.workspaces[workspaceID]
+	if !ok {
+		return AcceptedHead{}, fmt.Errorf("%w: workspace %q", ErrNotFound, workspaceID)
+	}
+	return workspace.head, nil
+}
+
+func (s *InMemoryStore) rejectCandidate(candidateID, reason string, now time.Time) (Candidate, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	candidate, ok := s.candidates[candidateID]
+	if !ok {
+		return Candidate{}, fmt.Errorf("%w: candidate %q", ErrNotFound, candidateID)
+	}
+	if candidate.Status != CandidatePending {
+		return Candidate{}, fmt.Errorf("%w: candidate %q is %q", ErrCandidateFinalized, candidateID, candidate.Status)
+	}
+	candidate.Status, candidate.RejectReason = CandidateRejected, reason
+	candidate.RejectedAt = &now
+	s.candidates[candidateID] = candidate
+	return copyCandidate(candidate), nil
+}
+
+func (s *InMemoryStore) collectRejectedBefore(cutoff time.Time) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	removed := 0
+	for id, candidate := range s.candidates {
+		if candidate.Status == CandidateRejected && candidate.RejectedAt != nil && candidate.RejectedAt.Before(cutoff) {
+			delete(s.candidates, id)
+			removed++
+		}
+	}
+	return removed
+}
+
 func (s *InMemoryStore) promoteCandidate(workspaceID, candidateID string, expectedRevision int64, now time.Time) (AcceptedHead, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -299,6 +355,10 @@ func copyCandidate(candidate Candidate) Candidate {
 	if candidate.AcceptedAt != nil {
 		acceptedAt := *candidate.AcceptedAt
 		candidate.AcceptedAt = &acceptedAt
+	}
+	if candidate.RejectedAt != nil {
+		rejectedAt := *candidate.RejectedAt
+		candidate.RejectedAt = &rejectedAt
 	}
 	return candidate
 }

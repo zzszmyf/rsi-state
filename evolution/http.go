@@ -6,30 +6,84 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // NewHTTPServer exposes the evolution control plane over a small JSON API.
 func NewHTTPServer(service *Service) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeError(w, http.StatusMethodNotAllowed, "only POST is supported")
-			return
-		}
-
 		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 		switch {
-		case len(parts) == 2 && parts[0] == "v1" && parts[1] == "workspaces":
+		case r.Method == http.MethodPost && len(parts) == 2 && parts[0] == "v1" && parts[1] == "workspaces":
 			createWorkspace(w, r, service)
-		case len(parts) == 4 && parts[0] == "v1" && parts[1] == "workspaces" && parts[3] == "events":
+		case r.Method == http.MethodGet && len(parts) == 3 && parts[0] == "v1" && parts[1] == "workspaces":
+			getHead(w, r, service, parts[2])
+		case r.Method == http.MethodPost && len(parts) == 4 && parts[0] == "v1" && parts[1] == "workspaces" && parts[3] == "events":
 			appendEvent(w, r, service, parts[2])
-		case len(parts) == 4 && parts[0] == "v1" && parts[1] == "workspaces" && parts[3] == "candidates":
+		case r.Method == http.MethodGet && len(parts) == 4 && parts[0] == "v1" && parts[1] == "workspaces" && parts[3] == "events":
+			listEvents(w, r, service, parts[2])
+		case r.Method == http.MethodPost && len(parts) == 4 && parts[0] == "v1" && parts[1] == "workspaces" && parts[3] == "candidates":
 			createCandidate(w, r, service, parts[2])
-		case len(parts) == 6 && parts[0] == "v1" && parts[1] == "workspaces" && parts[3] == "candidates" && parts[5] == "promote":
+		case r.Method == http.MethodGet && len(parts) == 5 && parts[0] == "v1" && parts[1] == "workspaces" && parts[3] == "candidates":
+			getCandidate(w, r, service, parts[4])
+		case r.Method == http.MethodPost && len(parts) == 6 && parts[0] == "v1" && parts[1] == "workspaces" && parts[3] == "candidates" && parts[5] == "promote":
 			promoteCandidate(w, r, service, parts[2], parts[4])
+		case r.Method == http.MethodPost && len(parts) == 6 && parts[0] == "v1" && parts[1] == "workspaces" && parts[3] == "candidates" && parts[5] == "reject":
+			rejectCandidate(w, r, service, parts[4])
+		case r.Method == http.MethodPost && len(parts) == 2 && parts[0] == "v1" && parts[1] == "gc":
+			collectRejected(w, r, service)
 		default:
 			writeError(w, http.StatusNotFound, "route not found")
 		}
+
 	})
+}
+
+func getHead(w http.ResponseWriter, r *http.Request, service *Service, workspaceID string) {
+	head, err := service.GetHead(r.Context(), workspaceID)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, head)
+}
+func listEvents(w http.ResponseWriter, r *http.Request, service *Service, workspaceID string) {
+	events, err := service.ListEvents(r.Context(), workspaceID)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, events)
+}
+func getCandidate(w http.ResponseWriter, r *http.Request, service *Service, candidateID string) {
+	candidate, err := service.GetCandidate(r.Context(), candidateID)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, candidate)
+}
+func rejectCandidate(w http.ResponseWriter, r *http.Request, service *Service, candidateID string) {
+	var input struct {
+		Reason string `json:"reason"`
+	}
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	candidate, err := service.RejectCandidate(r.Context(), candidateID, input.Reason)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, candidate)
+}
+func collectRejected(w http.ResponseWriter, r *http.Request, service *Service) {
+	cutoff, err := time.Parse(time.RFC3339, r.URL.Query().Get("before"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "before must be RFC3339")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"removed": service.CollectRejectedBefore(r.Context(), cutoff)})
 }
 
 func createWorkspace(w http.ResponseWriter, r *http.Request, service *Service) {

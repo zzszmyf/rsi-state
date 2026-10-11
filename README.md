@@ -144,11 +144,25 @@ The production promotion sequence is:
    conditional write.
 5. Treat the revision as accepted only after the CAS succeeds.
 
-## Next steps
+## Implemented operations
 
-- Add an S3 object store and DynamoDB/PostgreSQL CAS backend.
-- Add signed event envelopes and content hashes.
-- Add candidate rejection, TTL garbage collection, and retention policies.
-- Add read endpoints and a CLI for restore, diff, inspect, and verify.
-- Add OpenTelemetry metrics and authorization boundaries for Evolver,
-  Verifier, and Selector roles.
+- `GET /v1/workspaces/{workspace}` reads an accepted head.
+- `GET /v1/workspaces/{workspace}/events` reads immutable audit events.
+- `GET /v1/workspaces/{workspace}/candidates/{candidate}` inspects a candidate.
+- `POST .../reject` rejects a pending candidate with an auditable reason.
+- `POST /v1/gc?before=<RFC3339>` garbage-collects expired rejected candidates.
+- `rsi-state inspect`, `diff`, `restore`, and `verify` provide operator CLI
+  entry points. `restore` clones a local Git bundle into a destination.
+
+`evolution.SealEvent` produces an Ed25519-signed event envelope containing a
+SHA-256 content hash. `evolution.Authorize` supplies bearer-token roles:
+Evolver can propose state, Verifier can append evidence, Selector can promote,
+reject, or run retention cleanup, and all authenticated roles can read.
+`evolution.Instrument` exposes a standard OpenTelemetry request counter
+middleware.
+
+The `persistence` package provides production AWS adapters: content-addressed
+S3 artifact upload/download and a DynamoDB conditional accepted-head update.
+They use small injected AWS client interfaces and offline tests; deployers
+must supply AWS credentials, bucket/table configuration, retention policies,
+and server middleware wiring.
