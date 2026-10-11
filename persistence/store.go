@@ -48,6 +48,21 @@ type DurableStore struct {
 	Ledger  evolution.EventLedger
 }
 
+// Ready verifies both the immutable WAL store and conditional-head store are
+// reachable. A missing sentinel head is the expected healthy result.
+func (s DurableStore) Ready(ctx context.Context) error {
+	if s.Objects == nil || s.Heads == nil {
+		return fmt.Errorf("%w: durable object and head stores are required", evolution.ErrInvalidInput)
+	}
+	if _, err := s.Objects.List(ctx, s.key("wal")+"/"); err != nil {
+		return fmt.Errorf("durable object store readiness: %w", err)
+	}
+	if _, err := s.Heads.Get(ctx, "__rsi_state_readiness__"); err != nil && !errors.Is(err, evolution.ErrNotFound) {
+		return fmt.Errorf("durable head store readiness: %w", err)
+	}
+	return nil
+}
+
 func (s DurableStore) CreateWorkspace(workspaceID string, now time.Time) (evolution.AcceptedHead, error) {
 	head := evolution.AcceptedHead{WorkspaceID: workspaceID, Revision: 0, UpdatedAt: now.UTC()}
 	if err := s.Heads.Create(context.Background(), head); err != nil {

@@ -201,4 +201,19 @@ The `persistence` package provides production AWS adapters: content-addressed
 S3 artifact upload/download and a DynamoDB conditional accepted-head update.
 They use small injected AWS client interfaces and offline tests; deployers
 must supply AWS credentials, bucket/table configuration, retention policies,
-and server middleware wiring.
+and server middleware wiring. Production server wiring is documented in
+[`deploy/production.env.example`](deploy/production.env.example) and the
+[operational runbook](deploy/RUNBOOK.md). It uses verified mTLS workload
+identities mapped to least-privilege roles, never static bearer tokens.
+
+`verify` performs cryptographic verification, rather than displaying metadata:
+
+```bash
+rsi-state verify --event wal-event.json --trusted-keys trusted-keys.json
+```
+
+The registry is a JSON object from key ID to
+`{"role":"evolver","public_key":"<base64 Ed25519 public key>"}`. The key ID
+and role must match the signed envelope. `restore` requires an empty,
+operator-controlled destination and a local Git bundle; `diff` requires both
+specified revisions in its local Git workspace and never fetches revisions.

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/zzszmyf/rsi-state/evolution"
+	"go.opentelemetry.io/otel"
 )
 
 const compactSnapshotVersion = 1
@@ -43,6 +44,8 @@ type RecoveryState struct {
 // then removes WAL records represented by the checkpoint when deletion is
 // available. A failed deletion leaves redundant WAL, never an invalid state.
 func (s DurableStore) Compact(workspaceID string, now time.Time) (CompactSnapshot, error) {
+	ctx, span := otel.Tracer("rsi-state").Start(context.Background(), "rsi-state.compaction")
+	defer span.End()
 	if _, err := s.Heads.Get(context.Background(), workspaceID); err != nil {
 		return CompactSnapshot{}, err
 	}
@@ -111,6 +114,10 @@ func (s DurableStore) Compact(workspaceID string, now time.Time) (CompactSnapsho
 				}
 			}
 		}
+	}
+	counter, err := otel.Meter("rsi-state").Int64Counter("rsi_state_compactions_total")
+	if err == nil {
+		counter.Add(ctx, 1)
 	}
 	return snapshot, nil
 }

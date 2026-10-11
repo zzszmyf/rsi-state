@@ -10,6 +10,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -100,8 +105,10 @@ type CandidateInput struct {
 
 // Service applies the evolution state-machine rules to a backing store.
 type Service struct {
-	store StateStore
-	now   func() time.Time
+	store  StateStore
+	now    func() time.Time
+	meter  metric.Meter
+	tracer trace.Tracer
 }
 
 type StateStore interface {
@@ -116,11 +123,28 @@ type StateStore interface {
 	PromoteCandidate(string, string, int64, time.Time) (AcceptedHead, error)
 }
 
+// ReadyStore is implemented by backends that can prove their durable
+// dependencies are reachable without mutating state.
+type ReadyStore interface {
+	Ready(context.Context) error
+}
+
 func NewService(store StateStore, now func() time.Time) *Service {
 	if now == nil {
 		now = time.Now
 	}
-	return &Service{store: store, now: now}
+	return &Service{store: store, now: now, meter: otel.Meter("github.com/zzszmyf/rsi-state"), tracer: otel.Tracer("github.com/zzszmyf/rsi-state")}
+}
+
+// WithTelemetry attaches the application telemetry provider to a service.
+func (s *Service) WithTelemetry(meter metric.Meter, tracer trace.Tracer) *Service {
+	if meter != nil {
+		s.meter = meter
+	}
+	if tracer != nil {
+		s.tracer = tracer
+	}
+	return s
 }
 
 func (s *Service) CreateWorkspace(_ context.Context, workspaceID string) (AcceptedHead, error) {
@@ -130,12 +154,26 @@ func (s *Service) CreateWorkspace(_ context.Context, workspaceID string) (Accept
 	return s.store.CreateWorkspace(workspaceID, s.now().UTC())
 }
 
-func (s *Service) AppendEvent(_ context.Context, input EventInput) (Event, error) {
+func (s *Service) AppendEvent(ctx context.Context, input EventInput) (event Event, err error) {
+	ctx, span := s.tracer.Start(ctx, "rsi-state.wal.write")
+	defer span.End()
 	if strings.TrimSpace(input.WorkspaceID) == "" || input.ParentRevision < 0 ||
 		input.Kind == "" || strings.TrimSpace(input.Actor) == "" {
 		return Event{}, fmt.Errorf("%w: workspace ID, non-negative parent revision, kind, and actor are required", ErrInvalidInput)
 	}
-	return s.store.AppendEvent(input, s.now().UTC())
+	event, err = s.store.AppendEvent(input, s.now().UTC())
+	counter, counterErr := s.meter.Int64Counter("rsi_state_wal_writes_total")
+	if counterErr == nil {
+		outcome := "success"
+		if err != nil {
+			outcome = "error"
+		}
+		counter.Add(ctx, 1, metric.WithAttributes(attribute.String("outcome", outcome)))
+	}
+	if err != nil {
+		s.recordIntegrityFailure(ctx, err)
+	}
+	return event, err
 }
 
 func (s *Service) ListEvents(_ context.Context, workspaceID string) ([]Event, error) {
@@ -155,8 +193,27 @@ func (s *Service) GetCandidate(_ context.Context, candidateID string) (Candidate
 	return s.store.GetCandidate(candidateID)
 }
 
-func (s *Service) GetHead(_ context.Context, workspaceID string) (AcceptedHead, error) {
-	return s.store.GetHead(workspaceID)
+func (s *Service) GetHead(ctx context.Context, workspaceID string) (head AcceptedHead, err error) {
+	ctx, span := s.tracer.Start(ctx, "rsi-state.restore")
+	defer span.End()
+	start := time.Now()
+	head, err = s.store.GetHead(workspaceID)
+	histogram, histogramErr := s.meter.Float64Histogram("rsi_state_restore_duration_ms")
+	if histogramErr == nil {
+		histogram.Record(ctx, float64(time.Since(start).Microseconds())/1000)
+	}
+	if err != nil {
+		s.recordIntegrityFailure(ctx, err)
+	}
+	return head, err
+}
+
+// Ready checks the backing durable store when it exposes a readiness probe.
+func (s *Service) Ready(ctx context.Context) error {
+	if ready, ok := s.store.(ReadyStore); ok {
+		return ready.Ready(ctx)
+	}
+	return nil
 }
 
 func (s *Service) RejectCandidate(_ context.Context, candidateID, reason string) (Candidate, error) {
@@ -172,11 +229,33 @@ func (s *Service) CollectRejectedBefore(_ context.Context, cutoff time.Time) int
 
 // PromoteCandidate performs the accepted-head compare-and-swap. The candidate
 // stays pending whenever the caller has a stale head or candidate base.
-func (s *Service) PromoteCandidate(_ context.Context, workspaceID, candidateID string, expectedRevision int64) (AcceptedHead, error) {
+func (s *Service) PromoteCandidate(ctx context.Context, workspaceID, candidateID string, expectedRevision int64) (head AcceptedHead, err error) {
+	ctx, span := s.tracer.Start(ctx, "rsi-state.head.compare_and_swap")
+	defer span.End()
 	if expectedRevision < 0 {
 		return AcceptedHead{}, fmt.Errorf("%w: expected revision must be non-negative", ErrInvalidInput)
 	}
-	return s.store.PromoteCandidate(workspaceID, candidateID, expectedRevision, s.now().UTC())
+	head, err = s.store.PromoteCandidate(workspaceID, candidateID, expectedRevision, s.now().UTC())
+	if errors.Is(err, ErrRevisionConflict) {
+		counter, counterErr := s.meter.Int64Counter("rsi_state_cas_conflicts_total")
+		if counterErr == nil {
+			counter.Add(ctx, 1)
+		}
+	}
+	if err != nil {
+		s.recordIntegrityFailure(ctx, err)
+	}
+	return head, err
+}
+
+func (s *Service) recordIntegrityFailure(ctx context.Context, err error) {
+	if !errors.Is(err, ErrInvalidInput) {
+		return
+	}
+	counter, counterErr := s.meter.Int64Counter("rsi_state_integrity_failures_total")
+	if counterErr == nil {
+		counter.Add(ctx, 1)
+	}
 }
 
 type workspaceState struct {
@@ -208,10 +287,13 @@ func (s *InMemoryStore) CreateWorkspace(workspaceID string, now time.Time) (Acce
 	if _, exists := s.workspaces[workspaceID]; exists {
 		return AcceptedHead{}, fmt.Errorf("%w: workspace %q", ErrAlreadyExists, workspaceID)
 	}
+
 	head := AcceptedHead{WorkspaceID: workspaceID, Revision: 0, UpdatedAt: now}
 	s.workspaces[workspaceID] = &workspaceState{head: head}
 	return head, nil
 }
+
+func (*InMemoryStore) Ready(context.Context) error { return nil }
 
 func (s *InMemoryStore) AppendEvent(input EventInput, now time.Time) (Event, error) {
 	s.mu.Lock()
