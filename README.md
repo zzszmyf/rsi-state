@@ -48,10 +48,15 @@ Evolver / Verifier / Selector
 - Exposes a standard-library JSON HTTP API.
 - Includes TDD coverage for promotion, stale writes, stale candidates,
   immutable event payloads, and the HTTP workflow.
+- Provides `persistence.DurableStore`, which writes hash-bound immutable WAL
+  records and verifies the proposal, snapshot, and evaluation before an
+  accepted-head CAS. It reconstructs state after restart from S3 and DynamoDB
+  and maps conditional failures to `evolution.ErrRevisionConflict`.
 
-The current storage backend is process-local memory. The domain API is
-intentionally small so it can be backed by S3 immutable objects plus a
-conditional-write metadata store without changing the state-machine rules.
+The default local server uses process-local memory. Production callers compose
+`persistence.DurableStore{Objects: persistence.S3ObjectStore{...}, Heads:
+persistence.DynamoHeads{...}}`; its `StateStore` interface is the same one
+used by the in-memory test backend.
 
 ## Run
 
@@ -140,9 +145,10 @@ The production promotion sequence is:
 1. Create and validate a candidate in an isolated local worktree.
 2. Upload the immutable bundle, patch, evaluation, and event.
 3. Verify object hashes and artifact references.
-4. CAS-update `accepted-head.json` using its prior ETag, or use a DynamoDB
-   conditional write.
-5. Treat the revision as accepted only after the CAS succeeds.
+4. CAS-update the accepted head with DynamoDB's conditional write.
+5. Treat the revision as accepted only after the CAS succeeds. Reads re-verify
+   the referenced WAL event, snapshot, and evaluation hashes before returning
+   a nonzero accepted head.
 
 ## Implemented operations
 

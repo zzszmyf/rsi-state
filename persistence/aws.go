@@ -86,7 +86,7 @@ func (d DynamoHeads) CompareAndSwap(ctx context.Context, head evolution.Accepted
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("conditional accepted-head update: %w", err)
+		return mapConditionalError(err)
 	}
 	return nil
 }
@@ -99,11 +99,102 @@ func (d DynamoHeads) Get(ctx context.Context, workspaceID string) (evolution.Acc
 	if len(out.Item) == 0 {
 		return evolution.AcceptedHead{}, evolution.ErrNotFound
 	}
-	revision, err := strconv.ParseInt(out.Item["revision"].(*types.AttributeValueMemberN).Value, 10, 64)
+	revisionValue, ok := out.Item["revision"].(*types.AttributeValueMemberN)
+	if !ok {
+		return evolution.AcceptedHead{}, fmt.Errorf("invalid accepted-head revision")
+	}
+	revision, err := strconv.ParseInt(revisionValue.Value, 10, 64)
 	if err != nil {
 		return evolution.AcceptedHead{}, err
 	}
-	return evolution.AcceptedHead{WorkspaceID: workspaceID, Revision: revision, EventID: out.Item["event_id"].(*types.AttributeValueMemberS).Value, SnapshotRef: out.Item["snapshot_ref"].(*types.AttributeValueMemberS).Value}, nil
+	eventID, _ := out.Item["event_id"].(*types.AttributeValueMemberS)
+	snapshotRef, _ := out.Item["snapshot_ref"].(*types.AttributeValueMemberS)
+	updatedAt, _ := out.Item["updated_at"].(*types.AttributeValueMemberS)
+	head := evolution.AcceptedHead{WorkspaceID: workspaceID, Revision: revision}
+	if eventID != nil {
+		head.EventID = eventID.Value
+	}
+	if snapshotRef != nil {
+		head.SnapshotRef = snapshotRef.Value
+	}
+	if updatedAt != nil {
+		head.UpdatedAt, err = time.Parse(time.RFC3339Nano, updatedAt.Value)
+		if err != nil {
+			return evolution.AcceptedHead{}, fmt.Errorf("invalid accepted-head timestamp: %w", err)
+		}
+	}
+	return head, nil
 }
 
 func EncodeEvent(event evolution.EventEnvelope) ([]byte, error) { return json.Marshal(event) }
+
+// S3ObjectAPI is the S3 operation subset used by S3ObjectStore.
+type S3ObjectAPI interface {
+	PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error)
+	GetObject(context.Context, *s3.GetObjectInput, ...func(*s3.Options)) (*s3.GetObjectOutput, error)
+	ListObjectsV2(context.Context, *s3.ListObjectsV2Input, ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
+}
+
+// S3ObjectStore adapts an S3 bucket to DurableStore's ObjectStore interface.
+type S3ObjectStore struct {
+	Client S3ObjectAPI
+	Bucket string
+}
+
+func (s S3ObjectStore) Put(ctx context.Context, key string, body []byte, contentType string) error {
+	_, err := s.Client.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(s.Bucket), Key: aws.String(s.key(key)), Body: bytes.NewReader(body), ContentType: aws.String(contentType)})
+	return err
+}
+func (s S3ObjectStore) Get(ctx context.Context, key string) ([]byte, error) {
+	out, err := s.Client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.Bucket), Key: aws.String(s.key(key))})
+	if err != nil {
+		return nil, err
+	}
+	defer out.Body.Close()
+	return io.ReadAll(out.Body)
+}
+func (s S3ObjectStore) List(ctx context.Context, prefix string) ([]string, error) {
+	out, err := s.Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(s.Bucket), Prefix: aws.String(s.key(prefix))})
+	if err != nil {
+		return nil, err
+	}
+	keys := make([]string, 0, len(out.Contents))
+	for _, object := range out.Contents {
+		if object.Key != nil {
+			keys = append(keys, *object.Key)
+		}
+	}
+	return keys, nil
+}
+func (s S3ObjectStore) key(key string) string {
+	key = strings.TrimPrefix(key, "s3://"+s.Bucket+"/")
+	return strings.TrimPrefix(key, "/")
+}
+
+// Create initializes a head only if no accepted-head record exists.
+func (d DynamoHeads) Create(ctx context.Context, head evolution.AcceptedHead) error {
+	_, err := d.Client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(d.Table), Key: map[string]types.AttributeValue{"workspace_id": &types.AttributeValueMemberS{Value: head.WorkspaceID}},
+		UpdateExpression:    aws.String("SET revision = :revision, event_id = :event_id, snapshot_ref = :snapshot_ref, updated_at = :updated_at"),
+		ConditionExpression: aws.String("attribute_not_exists(workspace_id)"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":revision": &types.AttributeValueMemberN{Value: fmt.Sprint(head.Revision)}, ":event_id": &types.AttributeValueMemberS{Value: head.EventID}, ":snapshot_ref": &types.AttributeValueMemberS{Value: head.SnapshotRef}, ":updated_at": &types.AttributeValueMemberS{Value: head.UpdatedAt.UTC().Format(time.RFC3339Nano)},
+		},
+	})
+	if err != nil {
+		return mapConditionalError(err)
+	}
+	return nil
+}
+
+func mapConditionalError(err error) error {
+	var conditional *types.ConditionalCheckFailedException
+	if errors.As(err, &conditional) {
+		return fmt.Errorf("%w: %v", evolution.ErrRevisionConflict, err)
+	}
+	var apiErr interface{ ErrorCode() string }
+	if errors.As(err, &apiErr) && (apiErr.ErrorCode() == "ConditionalCheckFailedException" || apiErr.ErrorCode() == "PreconditionFailed") {
+		return fmt.Errorf("%w: %v", evolution.ErrRevisionConflict, err)
+	}
+	return err
+}

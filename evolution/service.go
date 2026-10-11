@@ -26,6 +26,9 @@ type EventKind string
 const (
 	EventKindCandidateProposed   EventKind = "candidate.proposed"
 	EventKindEvaluationCompleted EventKind = "evaluation.completed"
+	EventKindCandidatePromoted   EventKind = "candidate.promoted"
+	EventKindCandidateRejected   EventKind = "candidate.rejected"
+	EventKindCandidateRolledBack EventKind = "candidate.rolled_back"
 )
 
 type CandidateStatus string
