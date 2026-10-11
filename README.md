@@ -159,6 +159,13 @@ The production promotion sequence is:
 - `POST /v1/gc?before=<RFC3339>` garbage-collects expired rejected candidates.
 - `rsi-state inspect`, `diff`, `restore`, and `verify` provide operator CLI
   entry points. `restore` clones a local Git bundle into a destination.
+- `persistence.SnapshotStore` writes versioned, SHA-256-bound bundle manifests.
+  `persistence.WorkspaceCache` hydrates them only after verification into
+  isolated `workspaces/<workspace>/revisions/<revision>-<hash>` paths, rejects
+  stale or unsupported manifests, and bounds local storage by entry count.
+  `rsi-state cache-health --root <path>` inspects the cache and
+  `cache-repair` removes corrupt entries. Set `RSI_STATE_CACHE_ROOT` to mount
+  `GET /v1/cache/health` and `POST /v1/cache/repair` on the server.
 
 `evolution.SealEvent` produces an Ed25519-signed event envelope containing a
 SHA-256 content hash. `evolution.Authorize` supplies bearer-token roles:

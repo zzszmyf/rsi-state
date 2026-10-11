@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 
 	"github.com/zzszmyf/rsi-state/evolution"
+	"github.com/zzszmyf/rsi-state/persistence"
 )
 
 func main() {
@@ -25,7 +27,14 @@ func main() {
 	}
 	service := evolution.NewService(evolution.NewInMemoryStore(), nil)
 	log.Printf("rsi-state listening on %s", address)
-	if err := http.ListenAndServe(address, evolution.NewHTTPServer(service)); err != nil {
+	handler := http.Handler(evolution.NewHTTPServer(service))
+	if cacheRoot := os.Getenv("RSI_STATE_CACHE_ROOT"); cacheRoot != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/v1/cache/", http.StripPrefix("/v1/cache", persistence.NewCacheHTTPHandler(persistence.WorkspaceCache{Root: cacheRoot})))
+		mux.Handle("/", handler)
+		handler = mux
+	}
+	if err := http.ListenAndServe(address, handler); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -80,8 +89,27 @@ func runCommand(args []string) {
 			log.Fatal(err)
 		}
 		fmt.Printf("event=%s content_hash=%s signer=%s\\n", envelope.Event.ID, envelope.ContentHash, envelope.KeyID)
+	case "cache-health", "cache-repair":
+		flags := flag.NewFlagSet(args[0], flag.ExitOnError)
+		root := flags.String("root", "", "local workspace cache root")
+		flags.Parse(args[1:])
+		if *root == "" {
+			log.Fatal("cache root is required")
+		}
+		cache := persistence.WorkspaceCache{Root: *root}
+		var health persistence.CacheHealth
+		var err error
+		if args[0] == "cache-repair" {
+			health, err = cache.Repair(context.Background())
+		} else {
+			health, err = cache.Health(context.Background())
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+		_ = json.NewEncoder(os.Stdout).Encode(health)
 	default:
-		log.Fatalf("usage: rsi-state [serve|inspect|diff|restore|verify]")
+		log.Fatalf("usage: rsi-state [serve|inspect|diff|restore|verify|cache-health|cache-repair]")
 	}
 }
 func mustRead(response *http.Response) []byte {
