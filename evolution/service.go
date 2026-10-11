@@ -87,11 +87,23 @@ type CandidateInput struct {
 
 // Service applies the evolution state-machine rules to a backing store.
 type Service struct {
-	store *InMemoryStore
+	store StateStore
 	now   func() time.Time
 }
 
-func NewService(store *InMemoryStore, now func() time.Time) *Service {
+type StateStore interface {
+	CreateWorkspace(string, time.Time) (AcceptedHead, error)
+	AppendEvent(EventInput, time.Time) (Event, error)
+	ListEvents(string) ([]Event, error)
+	CreateCandidate(CandidateInput, time.Time) (Candidate, error)
+	GetCandidate(string) (Candidate, error)
+	GetHead(string) (AcceptedHead, error)
+	RejectCandidate(string, string, time.Time) (Candidate, error)
+	CollectRejectedBefore(time.Time) int
+	PromoteCandidate(string, string, int64, time.Time) (AcceptedHead, error)
+}
+
+func NewService(store StateStore, now func() time.Time) *Service {
 	if now == nil {
 		now = time.Now
 	}
@@ -102,7 +114,7 @@ func (s *Service) CreateWorkspace(_ context.Context, workspaceID string) (Accept
 	if strings.TrimSpace(workspaceID) == "" {
 		return AcceptedHead{}, fmt.Errorf("%w: workspace ID is required", ErrInvalidInput)
 	}
-	return s.store.createWorkspace(workspaceID, s.now().UTC())
+	return s.store.CreateWorkspace(workspaceID, s.now().UTC())
 }
 
 func (s *Service) AppendEvent(_ context.Context, input EventInput) (Event, error) {
@@ -110,11 +122,11 @@ func (s *Service) AppendEvent(_ context.Context, input EventInput) (Event, error
 		input.Kind == "" || strings.TrimSpace(input.Actor) == "" {
 		return Event{}, fmt.Errorf("%w: workspace ID, non-negative parent revision, kind, and actor are required", ErrInvalidInput)
 	}
-	return s.store.appendEvent(input, s.now().UTC())
+	return s.store.AppendEvent(input, s.now().UTC())
 }
 
 func (s *Service) ListEvents(_ context.Context, workspaceID string) ([]Event, error) {
-	return s.store.listEvents(workspaceID)
+	return s.store.ListEvents(workspaceID)
 }
 
 func (s *Service) CreateCandidate(_ context.Context, input CandidateInput) (Candidate, error) {
@@ -123,26 +135,26 @@ func (s *Service) CreateCandidate(_ context.Context, input CandidateInput) (Cand
 		strings.TrimSpace(input.SnapshotRef) == "" || strings.TrimSpace(input.EvaluationRef) == "" {
 		return Candidate{}, fmt.Errorf("%w: candidate ID, workspace ID, event, snapshot, evaluation, and non-negative base revision are required", ErrInvalidInput)
 	}
-	return s.store.createCandidate(input, s.now().UTC())
+	return s.store.CreateCandidate(input, s.now().UTC())
 }
 
 func (s *Service) GetCandidate(_ context.Context, candidateID string) (Candidate, error) {
-	return s.store.getCandidate(candidateID)
+	return s.store.GetCandidate(candidateID)
 }
 
 func (s *Service) GetHead(_ context.Context, workspaceID string) (AcceptedHead, error) {
-	return s.store.getHead(workspaceID)
+	return s.store.GetHead(workspaceID)
 }
 
 func (s *Service) RejectCandidate(_ context.Context, candidateID, reason string) (Candidate, error) {
 	if strings.TrimSpace(reason) == "" {
 		return Candidate{}, fmt.Errorf("%w: rejection reason is required", ErrInvalidInput)
 	}
-	return s.store.rejectCandidate(candidateID, reason, s.now().UTC())
+	return s.store.RejectCandidate(candidateID, reason, s.now().UTC())
 }
 
 func (s *Service) CollectRejectedBefore(_ context.Context, cutoff time.Time) int {
-	return s.store.collectRejectedBefore(cutoff.UTC())
+	return s.store.CollectRejectedBefore(cutoff.UTC())
 }
 
 // PromoteCandidate performs the accepted-head compare-and-swap. The candidate
@@ -151,7 +163,7 @@ func (s *Service) PromoteCandidate(_ context.Context, workspaceID, candidateID s
 	if expectedRevision < 0 {
 		return AcceptedHead{}, fmt.Errorf("%w: expected revision must be non-negative", ErrInvalidInput)
 	}
-	return s.store.promoteCandidate(workspaceID, candidateID, expectedRevision, s.now().UTC())
+	return s.store.PromoteCandidate(workspaceID, candidateID, expectedRevision, s.now().UTC())
 }
 
 type workspaceState struct {
@@ -176,7 +188,7 @@ func NewInMemoryStore() *InMemoryStore {
 	}
 }
 
-func (s *InMemoryStore) createWorkspace(workspaceID string, now time.Time) (AcceptedHead, error) {
+func (s *InMemoryStore) CreateWorkspace(workspaceID string, now time.Time) (AcceptedHead, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -188,7 +200,7 @@ func (s *InMemoryStore) createWorkspace(workspaceID string, now time.Time) (Acce
 	return head, nil
 }
 
-func (s *InMemoryStore) appendEvent(input EventInput, now time.Time) (Event, error) {
+func (s *InMemoryStore) AppendEvent(input EventInput, now time.Time) (Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -210,7 +222,7 @@ func (s *InMemoryStore) appendEvent(input EventInput, now time.Time) (Event, err
 	return copyEvent(event), nil
 }
 
-func (s *InMemoryStore) listEvents(workspaceID string) ([]Event, error) {
+func (s *InMemoryStore) ListEvents(workspaceID string) ([]Event, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -225,7 +237,7 @@ func (s *InMemoryStore) listEvents(workspaceID string) ([]Event, error) {
 	return events, nil
 }
 
-func (s *InMemoryStore) createCandidate(input CandidateInput, now time.Time) (Candidate, error) {
+func (s *InMemoryStore) CreateCandidate(input CandidateInput, now time.Time) (Candidate, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -248,7 +260,7 @@ func (s *InMemoryStore) createCandidate(input CandidateInput, now time.Time) (Ca
 	return candidate, nil
 }
 
-func (s *InMemoryStore) getCandidate(candidateID string) (Candidate, error) {
+func (s *InMemoryStore) GetCandidate(candidateID string) (Candidate, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -259,7 +271,7 @@ func (s *InMemoryStore) getCandidate(candidateID string) (Candidate, error) {
 	return copyCandidate(candidate), nil
 }
 
-func (s *InMemoryStore) getHead(workspaceID string) (AcceptedHead, error) {
+func (s *InMemoryStore) GetHead(workspaceID string) (AcceptedHead, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	workspace, ok := s.workspaces[workspaceID]
@@ -269,7 +281,7 @@ func (s *InMemoryStore) getHead(workspaceID string) (AcceptedHead, error) {
 	return workspace.head, nil
 }
 
-func (s *InMemoryStore) rejectCandidate(candidateID, reason string, now time.Time) (Candidate, error) {
+func (s *InMemoryStore) RejectCandidate(candidateID, reason string, now time.Time) (Candidate, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	candidate, ok := s.candidates[candidateID]
@@ -285,7 +297,7 @@ func (s *InMemoryStore) rejectCandidate(candidateID, reason string, now time.Tim
 	return copyCandidate(candidate), nil
 }
 
-func (s *InMemoryStore) collectRejectedBefore(cutoff time.Time) int {
+func (s *InMemoryStore) CollectRejectedBefore(cutoff time.Time) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	removed := 0
@@ -298,7 +310,7 @@ func (s *InMemoryStore) collectRejectedBefore(cutoff time.Time) int {
 	return removed
 }
 
-func (s *InMemoryStore) promoteCandidate(workspaceID, candidateID string, expectedRevision int64, now time.Time) (AcceptedHead, error) {
+func (s *InMemoryStore) PromoteCandidate(workspaceID, candidateID string, expectedRevision int64, now time.Time) (AcceptedHead, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
