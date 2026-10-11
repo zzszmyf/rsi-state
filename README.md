@@ -55,8 +55,10 @@ Evolver / Verifier / Selector
 
 The default local server uses process-local memory. Production callers compose
 `persistence.DurableStore{Objects: persistence.S3ObjectStore{...}, Heads:
-persistence.DynamoHeads{...}}`; its `StateStore` interface is the same one
-used by the in-memory test backend.
+persistence.DynamoHeads{...}, Ledger: keyring}`; a ledger is mandatory for
+durable writes. The S3 adapter requires a conditional write-once adapter (or
+an adapter backed by an equivalent bucket policy), and validates checksum and
+content type when artifacts are read.
 
 ## Run
 
@@ -167,8 +169,13 @@ The production promotion sequence is:
   `cache-repair` removes corrupt entries. Set `RSI_STATE_CACHE_ROOT` to mount
   `GET /v1/cache/health` and `POST /v1/cache/repair` on the server.
 
-`evolution.SealEvent` produces an Ed25519-signed event envelope containing a
-SHA-256 content hash. `evolution.Authorize` supplies bearer-token roles:
+`evolution.Keyring` seals Ed25519 envelopes and supports key rotation and
+revocation: revoked keys remain available to verify historical envelopes but
+cannot sign new ones. Each durable envelope includes its key ID, algorithm,
+signer role, parent envelope hash, artifact references, and selector decision
+in its canonical event payload. The WAL is a single hash chain and rejects
+tampering, forks, and replayed envelopes on every read. `evolution.Authorize`
+supplies bearer-token roles:
 Evolver can propose state, Verifier can append evidence, Selector can promote,
 reject, or run retention cleanup, and all authenticated roles can read.
 `evolution.Instrument` exposes a standard OpenTelemetry request counter

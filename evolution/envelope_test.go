@@ -14,16 +14,51 @@ func TestEventEnvelopeDetectsTampering(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	envelope, err := SealEvent(Event{ID: "evt-1", WorkspaceID: "arc", Kind: EventKindCandidateProposed, Actor: "evolver"}, "key-1", privateKey)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if err := envelope.Verify(publicKey); err != nil {
 		t.Fatalf("Verify() error = %v", err)
 	}
 	envelope.Event.Actor = "attacker"
 	if err := envelope.Verify(publicKey); !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("Verify() error = %v, want invalid input", err)
+	}
+}
+
+func TestKeyringRotatesAndRevokesWithoutInvalidatingHistory(t *testing.T) {
+	oldPublic, oldPrivate, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newPublic, newPrivate, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ring, err := NewKeyring(SigningKey{ID: "old", Role: RoleEvolver, PrivateKey: oldPrivate, PublicKey: oldPublic})
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := Event{ID: "evt-1", WorkspaceID: "arc", Kind: EventKindCandidateProposed, Actor: "evolver", SignerRole: RoleEvolver}
+	historical, err := ring.Seal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ring.Add(SigningKey{ID: "new", Role: RoleEvolver, PrivateKey: newPrivate, PublicKey: newPublic}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ring.Revoke("old"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ring.Verify(historical); err != nil {
+		t.Fatalf("historical event became unverifiable: %v", err)
+	}
+	current, err := ring.Seal(event)
+	if err != nil || current.KeyID != "new" {
+		t.Fatalf("Seal() = %#v, %v", current, err)
 	}
 }
 

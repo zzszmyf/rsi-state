@@ -48,21 +48,30 @@ type AcceptedHead struct {
 }
 
 type Event struct {
-	ID             string            `json:"id"`
-	WorkspaceID    string            `json:"workspace_id"`
-	ParentRevision int64             `json:"parent_revision"`
-	Kind           EventKind         `json:"kind"`
-	Actor          string            `json:"actor"`
-	Payload        map[string]string `json:"payload,omitempty"`
-	CreatedAt      time.Time         `json:"created_at"`
+	ID               string            `json:"id"`
+	WorkspaceID      string            `json:"workspace_id"`
+	ParentRevision   int64             `json:"parent_revision"`
+	Kind             EventKind         `json:"kind"`
+	Actor            string            `json:"actor"`
+	Payload          map[string]string `json:"payload,omitempty"`
+	KeyID            string            `json:"key_id,omitempty"`
+	SigningAlgorithm string            `json:"signing_algorithm,omitempty"`
+	SignerRole       Role              `json:"signer_role,omitempty"`
+	ParentHash       string            `json:"parent_hash,omitempty"`
+	ArtifactRefs     []string          `json:"artifact_refs,omitempty"`
+	SelectorDecision string            `json:"selector_decision,omitempty"`
+	CreatedAt        time.Time         `json:"created_at"`
 }
 
 type EventInput struct {
-	WorkspaceID    string            `json:"workspace_id"`
-	ParentRevision int64             `json:"parent_revision"`
-	Kind           EventKind         `json:"kind"`
-	Actor          string            `json:"actor"`
-	Payload        map[string]string `json:"payload,omitempty"`
+	WorkspaceID      string            `json:"workspace_id"`
+	ParentRevision   int64             `json:"parent_revision"`
+	Kind             EventKind         `json:"kind"`
+	Actor            string            `json:"actor"`
+	Payload          map[string]string `json:"payload,omitempty"`
+	SignerRole       Role              `json:"signer_role,omitempty"`
+	ArtifactRefs     []string          `json:"artifact_refs,omitempty"`
+	SelectorDecision string            `json:"selector_decision,omitempty"`
 }
 
 type Candidate struct {
@@ -363,6 +372,7 @@ func (s *workspaceState) containsEvent(eventID string) bool {
 
 func copyEvent(event Event) Event {
 	event.Payload = copyMap(event.Payload)
+	event.ArtifactRefs = append([]string(nil), event.ArtifactRefs...)
 	return event
 }
 

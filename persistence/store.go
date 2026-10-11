@@ -39,6 +39,7 @@ type DurableStore struct {
 	Objects ObjectStore
 	Heads   HeadStore
 	Prefix  string
+	Ledger  evolution.EventLedger
 }
 
 func (s DurableStore) CreateWorkspace(workspaceID string, now time.Time) (evolution.AcceptedHead, error) {
@@ -56,7 +57,18 @@ func (s DurableStore) AppendEvent(input evolution.EventInput, now time.Time) (ev
 	if _, err := s.Heads.Get(context.Background(), input.WorkspaceID); err != nil {
 		return evolution.Event{}, err
 	}
-	event := evolution.Event{ID: newID(), WorkspaceID: input.WorkspaceID, ParentRevision: input.ParentRevision, Kind: input.Kind, Actor: input.Actor, Payload: copyMap(input.Payload), CreatedAt: now.UTC()}
+	if s.Ledger == nil {
+		return evolution.Event{}, fmt.Errorf("%w: production durable store requires an event ledger", evolution.ErrInvalidInput)
+	}
+	parentHash, err := s.chainTip(input.WorkspaceID)
+	if err != nil {
+		return evolution.Event{}, err
+	}
+	role := input.SignerRole
+	if role == "" {
+		role = evolution.Role(input.Actor)
+	}
+	event := evolution.Event{ID: newID(), WorkspaceID: input.WorkspaceID, ParentRevision: input.ParentRevision, Kind: input.Kind, Actor: input.Actor, Payload: copyMap(input.Payload), SignerRole: role, ParentHash: parentHash, ArtifactRefs: append([]string(nil), input.ArtifactRefs...), SelectorDecision: input.SelectorDecision, CreatedAt: now.UTC()}
 	if err := s.putEvent(event); err != nil {
 		return evolution.Event{}, err
 	}
@@ -71,13 +83,20 @@ func (s DurableStore) ListEvents(workspaceID string) ([]evolution.Event, error) 
 	if err != nil {
 		return nil, fmt.Errorf("list WAL records: %w", err)
 	}
-	events := make([]evolution.Event, 0, len(keys))
+	envelopes := make([]evolution.EventEnvelope, 0, len(keys))
 	for _, key := range keys {
-		event, err := s.getEventKey(key)
+		envelope, err := s.getEnvelopeKey(key)
 		if err != nil {
 			return nil, err
 		}
-		events = append(events, event)
+		envelopes = append(envelopes, envelope)
+	}
+	if err := verifyChain(envelopes); err != nil {
+		return nil, err
+	}
+	events := make([]evolution.Event, 0, len(envelopes))
+	for _, envelope := range envelopes {
+		events = append(events, envelope.Event)
 	}
 	sort.Slice(events, func(i, j int) bool {
 		if events[i].CreatedAt.Equal(events[j].CreatedAt) {
@@ -92,8 +111,12 @@ func (s DurableStore) CreateCandidate(input evolution.CandidateInput, now time.T
 	if _, err := s.Heads.Get(context.Background(), input.WorkspaceID); err != nil {
 		return evolution.Candidate{}, err
 	}
-	if _, err := s.getEvent(input.WorkspaceID, input.EventID); err != nil {
+	event, err := s.getEvent(input.WorkspaceID, input.EventID)
+	if err != nil {
 		return evolution.Candidate{}, err
+	}
+	if event.Kind != evolution.EventKindCandidateProposed || !containsRefs(event.ArtifactRefs, input.SnapshotRef, input.EvaluationRef) {
+		return evolution.Candidate{}, fmt.Errorf("%w: proposal event must bind snapshot and evaluation artifacts", evolution.ErrInvalidInput)
 	}
 	if _, err := s.getCandidate(input.ID); err == nil {
 		return evolution.Candidate{}, fmt.Errorf("%w: candidate %q", evolution.ErrAlreadyExists, input.ID)
@@ -120,6 +143,25 @@ func (s DurableStore) GetCandidate(candidateID string) (evolution.Candidate, err
 	record, err := s.getCandidate(candidateID)
 	if err != nil {
 		return evolution.Candidate{}, err
+	}
+	events, err := s.ListEvents(record.WorkspaceID)
+	if err != nil {
+		return evolution.Candidate{}, err
+	}
+	for _, event := range events {
+		if event.Payload["candidate_id"] != candidateID {
+			continue
+		}
+		switch event.Kind {
+		case evolution.EventKindCandidateRejected:
+			record.Status, record.RejectReason = evolution.CandidateRejected, event.Payload["reason"]
+			at := event.CreatedAt
+			record.RejectedAt = &at
+		case evolution.EventKindCandidatePromoted:
+			record.Status = evolution.CandidateAccepted
+			at := event.CreatedAt
+			record.AcceptedAt = &at
+		}
 	}
 	// A successful CAS is authoritative even if a process dies before it writes
 	// the denormalized candidate status.
@@ -162,12 +204,7 @@ func (s DurableStore) RejectCandidate(candidateID, reason string, now time.Time)
 	if err := s.appendSystemEvent(record.WorkspaceID, record.BaseRevision, evolution.EventKindCandidateRejected, "selector", map[string]string{"candidate_id": candidateID, "reason": reason}, now); err != nil {
 		return evolution.Candidate{}, err
 	}
-	record.Status, record.RejectReason = evolution.CandidateRejected, reason
-	record.RejectedAt = ptr(now.UTC())
-	if err := s.putJSON(s.candidateKey(candidateID), record); err != nil {
-		return evolution.Candidate{}, err
-	}
-	return record.Candidate, nil
+	return s.GetCandidate(candidateID)
 }
 
 func (s DurableStore) CollectRejectedBefore(cutoff time.Time) int { return 0 }
@@ -202,23 +239,18 @@ func (s DurableStore) PromoteCandidate(workspaceID, candidateID string, expected
 	if err := s.verifyObjectHash(record.EvaluationRef, record.EvaluationSHA256); err != nil {
 		return evolution.AcceptedHead{}, fmt.Errorf("verify evaluation: %w", err)
 	}
-	if err := s.appendSystemEvent(workspaceID, head.Revision, evolution.EventKindCandidatePromoted, "selector", map[string]string{"candidate_id": candidateID, "event_id": record.EventID}, now); err != nil {
-		return evolution.AcceptedHead{}, err
-	}
 	next := evolution.AcceptedHead{WorkspaceID: workspaceID, Revision: head.Revision + 1, EventID: record.EventID, SnapshotRef: record.SnapshotRef, UpdatedAt: now.UTC()}
 	if err := s.Heads.CompareAndSwap(context.Background(), next, expectedRevision); err != nil {
 		return evolution.AcceptedHead{}, err
 	}
-	record.Status, record.AcceptedAt = evolution.CandidateAccepted, ptr(now.UTC())
-	if err := s.putJSON(s.candidateKey(candidateID), record); err != nil {
+	if err := s.appendSystemEvent(workspaceID, head.Revision, evolution.EventKindCandidatePromoted, "selector", map[string]string{"candidate_id": candidateID, "event_id": record.EventID}, now); err != nil {
 		return evolution.AcceptedHead{}, err
 	}
 	return next, nil
 }
 
 type walRecord struct {
-	Event  evolution.Event `json:"event"`
-	SHA256 string          `json:"sha256"`
+	Envelope evolution.EventEnvelope `json:"envelope"`
 }
 type candidateRecord struct {
 	evolution.Candidate
@@ -227,31 +259,54 @@ type candidateRecord struct {
 }
 
 func (s DurableStore) appendSystemEvent(workspace string, revision int64, kind evolution.EventKind, actor string, payload map[string]string, now time.Time) error {
-	_, err := s.AppendEvent(evolution.EventInput{WorkspaceID: workspace, ParentRevision: revision, Kind: kind, Actor: actor, Payload: payload}, now)
+	decision := ""
+	if kind == evolution.EventKindCandidatePromoted {
+		decision = "promote"
+	}
+	if kind == evolution.EventKindCandidateRejected {
+		decision = "reject"
+	}
+	_, err := s.AppendEvent(evolution.EventInput{WorkspaceID: workspace, ParentRevision: revision, Kind: kind, Actor: actor, SignerRole: evolution.RoleSelector, Payload: payload, SelectorDecision: decision}, now)
 	return err
 }
 func (s DurableStore) putEvent(event evolution.Event) error {
-	b, err := json.Marshal(event)
+	envelope, err := s.Ledger.Seal(event)
 	if err != nil {
 		return err
 	}
-	sum := sha256.Sum256(b)
-	return s.putJSON(s.key("wal", event.WorkspaceID, event.ID+".json"), walRecord{Event: event, SHA256: hex.EncodeToString(sum[:])})
+	return s.putJSON(s.key("wal", event.WorkspaceID, event.ID+".json"), walRecord{Envelope: envelope})
 }
 func (s DurableStore) getEvent(workspace, id string) (evolution.Event, error) {
-	return s.getEventKey(s.key("wal", workspace, id+".json"))
-}
-func (s DurableStore) getEventKey(key string) (evolution.Event, error) {
-	var r walRecord
-	if err := s.getJSON(key, &r); err != nil {
+	events, err := s.ListEvents(workspace)
+	if err != nil {
 		return evolution.Event{}, err
 	}
-	b, _ := json.Marshal(r.Event)
-	sum := sha256.Sum256(b)
-	if r.SHA256 != hex.EncodeToString(sum[:]) {
-		return evolution.Event{}, fmt.Errorf("%w: WAL event hash mismatch", evolution.ErrInvalidInput)
+	for _, event := range events {
+		if event.ID == id {
+			return event, nil
+		}
 	}
-	return r.Event, nil
+	return evolution.Event{}, fmt.Errorf("%w: WAL event %q", evolution.ErrNotFound, id)
+}
+func (s DurableStore) getEventKey(key string) (evolution.Event, error) {
+	envelope, err := s.getEnvelopeKey(key)
+	if err != nil {
+		return evolution.Event{}, err
+	}
+	return envelope.Event, nil
+}
+func (s DurableStore) getEnvelopeKey(key string) (evolution.EventEnvelope, error) {
+	var r walRecord
+	if err := s.getJSON(key, &r); err != nil {
+		return evolution.EventEnvelope{}, err
+	}
+	if s.Ledger == nil {
+		return evolution.EventEnvelope{}, fmt.Errorf("%w: production durable store requires an event ledger", evolution.ErrInvalidInput)
+	}
+	if err := s.Ledger.Verify(r.Envelope); err != nil {
+		return evolution.EventEnvelope{}, err
+	}
+	return r.Envelope, nil
 }
 func (s DurableStore) candidateForHead(head evolution.AcceptedHead) (candidateRecord, error) {
 	keys, err := s.Objects.List(context.Background(), s.key("candidates")+"/")
@@ -327,6 +382,96 @@ func (s DurableStore) getJSON(key string, target any) error {
 	}
 	return nil
 }
+func (s DurableStore) chainTip(workspace string) (string, error) {
+	keys, err := s.Objects.List(context.Background(), s.key("wal", workspace)+"/")
+	if err != nil {
+		return "", err
+	}
+	if len(keys) == 0 {
+		return "", nil
+	}
+	envelopes := make([]evolution.EventEnvelope, 0, len(keys))
+	for _, key := range keys {
+		envelope, err := s.getEnvelopeKey(key)
+		if err != nil {
+			return "", err
+		}
+		envelopes = append(envelopes, envelope)
+	}
+	if err := verifyChain(envelopes); err != nil {
+		return "", err
+	}
+	parents := make(map[string]bool, len(envelopes))
+	for _, envelope := range envelopes {
+		parents[envelope.Event.ParentHash] = true
+	}
+	for _, envelope := range envelopes {
+		if !parents[envelope.ContentHash] {
+			return envelope.ContentHash, nil
+		}
+	}
+	return "", fmt.Errorf("%w: missing ledger tip", evolution.ErrInvalidInput)
+}
+func verifyChain(envelopes []evolution.EventEnvelope) error {
+	if len(envelopes) == 0 {
+		return nil
+	}
+	byHash, children := make(map[string]evolution.EventEnvelope, len(envelopes)), make(map[string]int, len(envelopes))
+	for _, envelope := range envelopes {
+		if envelope.ContentHash == "" {
+			return fmt.Errorf("%w: missing envelope hash", evolution.ErrInvalidInput)
+		}
+		if _, exists := byHash[envelope.ContentHash]; exists {
+			return fmt.Errorf("%w: replayed envelope", evolution.ErrInvalidInput)
+		}
+		byHash[envelope.ContentHash] = envelope
+		children[envelope.Event.ParentHash]++
+		if children[envelope.Event.ParentHash] > 1 {
+			return fmt.Errorf("%w: ledger fork/replay", evolution.ErrInvalidInput)
+		}
+	}
+	var current evolution.EventEnvelope
+	for _, envelope := range byHash {
+		if envelope.Event.ParentHash == "" {
+			current = envelope
+			break
+		}
+	}
+	if current.ContentHash == "" {
+		return fmt.Errorf("%w: ledger has no genesis event", evolution.ErrInvalidInput)
+	}
+	for visited := 1; ; visited++ {
+		nextHash := ""
+		for hash, envelope := range byHash {
+			if envelope.Event.ParentHash == current.ContentHash {
+				nextHash = hash
+				break
+			}
+		}
+		if nextHash == "" {
+			if visited != len(byHash) {
+				return fmt.Errorf("%w: disconnected ledger", evolution.ErrInvalidInput)
+			}
+			return nil
+		}
+		current = byHash[nextHash]
+	}
+}
+func containsRefs(refs []string, wanted ...string) bool {
+	for _, want := range wanted {
+		found := false
+		for _, ref := range refs {
+			if ref == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
 func ptr(t time.Time) *time.Time { return &t }
 func copyMap(in map[string]string) map[string]string {
 	if in == nil {
@@ -348,16 +493,30 @@ func newID() string {
 
 // MemoryObjects is a deterministic ObjectStore useful for integration tests.
 type MemoryObjects struct {
-	mu     sync.RWMutex
-	Values map[string][]byte
+	mu           sync.RWMutex
+	Values       map[string][]byte
+	ContentTypes map[string]string
 }
 
-func NewMemoryObjects() *MemoryObjects { return &MemoryObjects{Values: map[string][]byte{}} }
-func (m *MemoryObjects) Put(_ context.Context, key string, body []byte, _ string) error {
+func NewMemoryObjects() *MemoryObjects {
+	return &MemoryObjects{Values: map[string][]byte{}, ContentTypes: map[string]string{}}
+}
+func (m *MemoryObjects) Put(_ context.Context, key string, body []byte, contentType string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.Values[key]; exists {
+		return fmt.Errorf("%w: immutable object %q", evolution.ErrAlreadyExists, key)
+	}
+	m.Values[key] = append([]byte(nil), body...)
+	m.ContentTypes[key] = contentType
+	return nil
+}
+
+// Tamper exists only to model an out-of-band storage compromise in tests.
+func (m *MemoryObjects) Tamper(key string, body []byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.Values[key] = append([]byte(nil), body...)
-	return nil
 }
 func (m *MemoryObjects) Get(_ context.Context, key string) ([]byte, error) {
 	m.mu.RLock()

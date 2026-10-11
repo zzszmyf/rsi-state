@@ -2,6 +2,8 @@ package persistence
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"errors"
 	"sync"
 	"testing"
@@ -49,7 +51,7 @@ func (m *memoryHeads) Get(_ context.Context, workspace string) (evolution.Accept
 
 func TestDurableStoreRestartsFromWALAndHead(t *testing.T) {
 	objects, heads := NewMemoryObjects(), newMemoryHeads()
-	store := DurableStore{Objects: objects, Heads: heads, Prefix: "rsi"}
+	store := DurableStore{Objects: objects, Heads: heads, Prefix: "rsi", Ledger: testLedger(t)}
 	now := time.Date(2026, 10, 11, 0, 0, 0, 0, time.UTC)
 	if _, err := store.CreateWorkspace("arc", now); err != nil {
 		t.Fatal(err)
@@ -60,7 +62,7 @@ func TestDurableStoreRestartsFromWALAndHead(t *testing.T) {
 	}
 
 	// A new store instance represents a process restart: it has no local state.
-	restarted := DurableStore{Objects: objects, Heads: heads, Prefix: "rsi"}
+	restarted := DurableStore{Objects: objects, Heads: heads, Prefix: "rsi", Ledger: store.Ledger}
 	head, err := restarted.GetHead("arc")
 	if err != nil {
 		t.Fatal(err)
@@ -86,7 +88,7 @@ func TestDurableStoreRestartsFromWALAndHead(t *testing.T) {
 
 func TestDurableStoreCompetingPromotionsOnlyOneWins(t *testing.T) {
 	objects, heads := NewMemoryObjects(), newMemoryHeads()
-	store := DurableStore{Objects: objects, Heads: heads}
+	store := DurableStore{Objects: objects, Heads: heads, Ledger: testLedger(t)}
 	now := time.Date(2026, 10, 11, 0, 0, 0, 0, time.UTC)
 	if _, err := store.CreateWorkspace("arc", now); err != nil {
 		t.Fatal(err)
@@ -126,15 +128,13 @@ func TestDurableStoreCompetingPromotionsOnlyOneWins(t *testing.T) {
 
 func TestDurableStoreRejectsHashMismatchWithoutAdvancingHead(t *testing.T) {
 	objects, heads := NewMemoryObjects(), newMemoryHeads()
-	store := DurableStore{Objects: objects, Heads: heads}
+	store := DurableStore{Objects: objects, Heads: heads, Ledger: testLedger(t)}
 	now := time.Date(2026, 10, 11, 0, 0, 0, 0, time.UTC)
 	if _, err := store.CreateWorkspace("arc", now); err != nil {
 		t.Fatal(err)
 	}
 	candidate := createDurableCandidate(t, store, objects, "arc", "first", 0, now)
-	if err := objects.Put(context.Background(), "bucket/snapshots/first", []byte("tampered"), "application/octet-stream"); err != nil {
-		t.Fatal(err)
-	}
+	objects.Tamper("bucket/snapshots/first", []byte("tampered"))
 	if _, err := store.PromoteCandidate("arc", candidate.ID, 0, now); !errors.Is(err, evolution.ErrInvalidInput) {
 		t.Fatalf("PromoteCandidate() error = %v", err)
 	}
@@ -157,7 +157,11 @@ func createDurableCandidate(t *testing.T, store DurableStore, objects *MemoryObj
 	if err := objects.Put(context.Background(), "bucket/evaluations/"+id, []byte("evaluation-"+id), "application/json"); err != nil {
 		t.Fatal(err)
 	}
-	event, err := store.AppendEvent(evolution.EventInput{WorkspaceID: workspace, ParentRevision: base, Kind: evolution.EventKindCandidateProposed, Actor: "evolver", Payload: map[string]string{"candidate_id": id}}, now)
+	event, err := store.AppendEvent(evolution.EventInput{
+		WorkspaceID: workspace, ParentRevision: base, Kind: evolution.EventKindCandidateProposed,
+		Actor: "evolver", SignerRole: evolution.RoleEvolver, ArtifactRefs: []string{snapshot, evaluation},
+		Payload: map[string]string{"candidate_id": id},
+	}, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +174,7 @@ func createDurableCandidate(t *testing.T, store DurableStore, objects *MemoryObj
 
 func TestDurableStoreDoesNotExposeCorruptAcceptedHead(t *testing.T) {
 	objects, heads := NewMemoryObjects(), newMemoryHeads()
-	store := DurableStore{Objects: objects, Heads: heads}
+	store := DurableStore{Objects: objects, Heads: heads, Ledger: testLedger(t)}
 	now := time.Date(2026, 10, 11, 0, 0, 0, 0, time.UTC)
 	if _, err := store.CreateWorkspace("arc", now); err != nil {
 		t.Fatal(err)
@@ -179,9 +183,7 @@ func TestDurableStoreDoesNotExposeCorruptAcceptedHead(t *testing.T) {
 	if _, err := store.PromoteCandidate("arc", candidate.ID, 0, now); err != nil {
 		t.Fatal(err)
 	}
-	if err := objects.Put(context.Background(), "bucket/evaluations/first", []byte("tampered"), "application/json"); err != nil {
-		t.Fatal(err)
-	}
+	objects.Tamper("bucket/evaluations/first", []byte("tampered"))
 	if _, err := store.GetHead("arc"); !errors.Is(err, evolution.ErrInvalidInput) {
 		t.Fatalf("GetHead() error = %v, want hash failure", err)
 	}
@@ -189,21 +191,61 @@ func TestDurableStoreDoesNotExposeCorruptAcceptedHead(t *testing.T) {
 
 func TestDurableStoreRejectionIsRecordedInWAL(t *testing.T) {
 	objects, heads := NewMemoryObjects(), newMemoryHeads()
-	store := DurableStore{Objects: objects, Heads: heads}
+	store := DurableStore{Objects: objects, Heads: heads, Ledger: testLedger(t)}
 	now := time.Date(2026, 10, 11, 0, 0, 0, 0, time.UTC)
 	if _, err := store.CreateWorkspace("arc", now); err != nil {
 		t.Fatal(err)
 	}
+
 	candidate := createDurableCandidate(t, store, objects, "arc", "first", 0, now)
 	if _, err := store.RejectCandidate(candidate.ID, "holdout regression", now); err != nil {
 		t.Fatal(err)
 	}
+
 	events, err := store.ListEvents("arc")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(events) != 2 || !hasEventKind(events, evolution.EventKindCandidateRejected) {
 		t.Fatalf("WAL events = %#v", events)
+	}
+}
+
+func TestDurableStoreRejectsUnsignedAndReplayedWAL(t *testing.T) {
+	objects, heads := NewMemoryObjects(), newMemoryHeads()
+	store := DurableStore{Objects: objects, Heads: heads}
+	now := time.Date(2026, 10, 11, 0, 0, 0, 0, time.UTC)
+	if _, err := store.CreateWorkspace("arc", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AppendEvent(evolution.EventInput{WorkspaceID: "arc", ParentRevision: 0, Kind: evolution.EventKindCandidateProposed, Actor: "evolver"}, now); !errors.Is(err, evolution.ErrInvalidInput) {
+		t.Fatalf("unsigned AppendEvent() error = %v", err)
+	}
+	store.Ledger = testLedger(t)
+	event, err := store.AppendEvent(evolution.EventInput{WorkspaceID: "arc", ParentRevision: 0, Kind: evolution.EventKindCandidateProposed, Actor: "evolver", SignerRole: evolution.RoleEvolver}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := store.key("wal", "arc", event.ID+".json")
+	original := objects.Values[key]
+	objects.Tamper(key, []byte(`{"envelope":{}}`))
+	if _, err := store.ListEvents("arc"); !errors.Is(err, evolution.ErrInvalidInput) {
+		t.Fatalf("ListEvents() tamper error = %v", err)
+	}
+	objects.Tamper(key, original)
+	objects.Values[store.key("wal", "arc", "replay.json")] = append([]byte(nil), original...)
+	if _, err := store.ListEvents("arc"); !errors.Is(err, evolution.ErrInvalidInput) {
+		t.Fatalf("ListEvents() replay error = %v", err)
+	}
+}
+
+func TestMemoryObjectsRejectDuplicateWrites(t *testing.T) {
+	objects := NewMemoryObjects()
+	if err := objects.Put(context.Background(), "immutable", []byte("one"), "text/plain"); err != nil {
+		t.Fatal(err)
+	}
+	if err := objects.Put(context.Background(), "immutable", []byte("two"), "text/plain"); !errors.Is(err, evolution.ErrAlreadyExists) {
+		t.Fatalf("second Put() error = %v", err)
 	}
 }
 
@@ -214,4 +256,24 @@ func hasEventKind(events []evolution.Event, want evolution.EventKind) bool {
 		}
 	}
 	return false
+}
+
+func testLedger(t *testing.T) evolution.EventLedger {
+	t.Helper()
+	evolverPublic, evolverPrivate, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selectorPublic, selectorPrivate, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger, err := evolution.NewKeyring(
+		evolution.SigningKey{ID: "evolver-1", Role: evolution.RoleEvolver, PrivateKey: evolverPrivate, PublicKey: evolverPublic},
+		evolution.SigningKey{ID: "selector-1", Role: evolution.RoleSelector, PrivateKey: selectorPrivate, PublicKey: selectorPublic},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ledger
 }

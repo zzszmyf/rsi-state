@@ -52,9 +52,7 @@ func TestWorkspaceCacheRejectsTamperedBundleAndCleansPartial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := objects.Put(context.Background(), manifest.BundleRef, []byte("tampered"), "application/octet-stream"); err != nil {
-		t.Fatal(err)
-	}
+	objects.Tamper(manifest.BundleRef, []byte("tampered"))
 	cache := WorkspaceCache{Root: t.TempDir(), Snapshots: snapshots}
 	if _, err := cache.Hydrate(context.Background(), manifest); !errors.Is(err, ErrIntegrity) {
 		t.Fatalf("Hydrate() error = %v, want integrity error", err)
@@ -81,9 +79,7 @@ func TestSnapshotStoreRejectsTamperedManifest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := objects.Put(context.Background(), snapshots.manifestKey(manifest), body, "application/json"); err != nil {
-		t.Fatal(err)
-	}
+	objects.Tamper(snapshots.manifestKey(manifest), body)
 	if _, err := snapshots.Get(context.Background(), "arc", 1); !errors.Is(err, ErrIntegrity) {
 		t.Fatalf("Get() error = %v, want manifest integrity error", err)
 	}

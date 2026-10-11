@@ -27,10 +27,13 @@ type S3API interface {
 	PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error)
 	GetObject(context.Context, *s3.GetObjectInput, ...func(*s3.Options)) (*s3.GetObjectOutput, error)
 }
+type ConditionalS3API interface {
+	PutObjectIfAbsent(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error)
+}
 
 type Artifact struct {
-	URI, SHA256 string
-	Size        int64
+	URI, SHA256, ContentType string
+	Size                     int64
 }
 type S3Artifacts struct {
 	Client         S3API
@@ -43,11 +46,15 @@ func (s S3Artifacts) PutImmutable(ctx context.Context, name string, body []byte,
 	}
 	sum := sha256.Sum256(body)
 	key := path.Join(strings.Trim(s.Prefix, "/"), hex.EncodeToString(sum[:]), path.Base(name))
-	_, err := s.Client.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(s.Bucket), Key: aws.String(key), Body: bytes.NewReader(body), ContentType: aws.String(contentType), ChecksumSHA256: aws.String(base64SHA256(sum[:]))})
+	conditional, ok := s.Client.(ConditionalS3API)
+	if !ok {
+		return Artifact{}, errors.New("S3 write-once adapter is required for immutable artifacts")
+	}
+	_, err := conditional.PutObjectIfAbsent(ctx, &s3.PutObjectInput{Bucket: aws.String(s.Bucket), Key: aws.String(key), Body: bytes.NewReader(body), ContentType: aws.String(contentType), ChecksumSHA256: aws.String(base64SHA256(sum[:]))})
 	if err != nil {
 		return Artifact{}, fmt.Errorf("put immutable artifact: %w", err)
 	}
-	return Artifact{URI: "s3://" + s.Bucket + "/" + key, SHA256: hex.EncodeToString(sum[:]), Size: int64(len(body))}, nil
+	return Artifact{URI: "s3://" + s.Bucket + "/" + key, SHA256: hex.EncodeToString(sum[:]), ContentType: contentType, Size: int64(len(body))}, nil
 }
 
 func (s S3Artifacts) Get(ctx context.Context, key string) ([]byte, error) {
@@ -56,7 +63,43 @@ func (s S3Artifacts) Get(ctx context.Context, key string) ([]byte, error) {
 		return nil, fmt.Errorf("get artifact: %w", err)
 	}
 	defer out.Body.Close()
-	return io.ReadAll(out.Body)
+	body, err := io.ReadAll(out.Body)
+	if err != nil {
+		return nil, err
+	}
+	if out.ContentType == nil || strings.TrimSpace(*out.ContentType) == "" {
+		return nil, fmt.Errorf("%w: artifact content type missing", evolution.ErrInvalidInput)
+	}
+	sum := sha256.Sum256(body)
+	if out.ChecksumSHA256 == nil || *out.ChecksumSHA256 != base64SHA256(sum[:]) {
+		return nil, fmt.Errorf("%w: artifact checksum mismatch", evolution.ErrInvalidInput)
+	}
+	return body, nil
+}
+
+// GetVerified verifies the checksum and exact content type recorded when the
+// artifact was persisted. Production callers should retain Artifact metadata.
+func (s S3Artifacts) GetVerified(ctx context.Context, artifact Artifact) ([]byte, error) {
+	body, err := s.Get(ctx, artifact.URI)
+	if err != nil {
+		return nil, err
+	}
+	if artifact.ContentType == "" {
+		return nil, fmt.Errorf("%w: expected content type is required", evolution.ErrInvalidInput)
+	}
+	out, err := s.Client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.Bucket), Key: aws.String(strings.TrimPrefix(artifact.URI, "s3://"+s.Bucket+"/"))})
+	if err != nil {
+		return nil, fmt.Errorf("get artifact metadata: %w", err)
+	}
+	defer out.Body.Close()
+	if out.ContentType == nil || *out.ContentType != artifact.ContentType {
+		return nil, fmt.Errorf("%w: artifact content type mismatch", evolution.ErrInvalidInput)
+	}
+	sum := sha256.Sum256(body)
+	if hex.EncodeToString(sum[:]) != artifact.SHA256 {
+		return nil, fmt.Errorf("%w: artifact checksum mismatch", evolution.ErrInvalidInput)
+	}
+	return body, nil
 }
 
 func base64SHA256(raw []byte) string {
@@ -141,8 +184,20 @@ type S3ObjectStore struct {
 	Bucket string
 }
 
+// ConditionalS3ObjectAPI is the adapter boundary for write-once object
+// creation. Current AWS SDK versions used by this module predate PutObject's
+// If-None-Match field, so production adapters must map this to S3 conditional
+// creation or a bucket policy that rejects overwrites.
 func (s S3ObjectStore) Put(ctx context.Context, key string, body []byte, contentType string) error {
-	_, err := s.Client.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(s.Bucket), Key: aws.String(s.key(key)), Body: bytes.NewReader(body), ContentType: aws.String(contentType)})
+	conditional, ok := s.Client.(ConditionalS3API)
+	if !ok {
+		return errors.New("S3 write-once adapter is required for durable records")
+	}
+	sum := sha256.Sum256(body)
+	_, err := conditional.PutObjectIfAbsent(ctx, &s3.PutObjectInput{Bucket: aws.String(s.Bucket), Key: aws.String(s.key(key)), Body: bytes.NewReader(body), ContentType: aws.String(contentType), ChecksumSHA256: aws.String(base64SHA256(sum[:]))})
+	if err != nil {
+		return mapConditionalError(err)
+	}
 	return err
 }
 func (s S3ObjectStore) Get(ctx context.Context, key string) ([]byte, error) {
@@ -151,7 +206,18 @@ func (s S3ObjectStore) Get(ctx context.Context, key string) ([]byte, error) {
 		return nil, err
 	}
 	defer out.Body.Close()
-	return io.ReadAll(out.Body)
+	body, err := io.ReadAll(out.Body)
+	if err != nil {
+		return nil, err
+	}
+	if out.ContentType == nil || strings.TrimSpace(*out.ContentType) == "" {
+		return nil, fmt.Errorf("%w: object content type missing", evolution.ErrInvalidInput)
+	}
+	sum := sha256.Sum256(body)
+	if out.ChecksumSHA256 == nil || *out.ChecksumSHA256 != base64SHA256(sum[:]) {
+		return nil, fmt.Errorf("%w: object checksum mismatch", evolution.ErrInvalidInput)
+	}
+	return body, nil
 }
 func (s S3ObjectStore) List(ctx context.Context, prefix string) ([]string, error) {
 	out, err := s.Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(s.Bucket), Prefix: aws.String(s.key(prefix))})
