@@ -29,6 +29,7 @@ const (
 	EventKindCandidatePromoted   EventKind = "candidate.promoted"
 	EventKindCandidateRejected   EventKind = "candidate.rejected"
 	EventKindCandidateRolledBack EventKind = "candidate.rolled_back"
+	EventKindHistoryCompacted    EventKind = "history.compacted"
 )
 
 type CandidateStatus string

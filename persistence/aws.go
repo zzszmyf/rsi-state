@@ -177,6 +177,9 @@ type S3ObjectAPI interface {
 	GetObject(context.Context, *s3.GetObjectInput, ...func(*s3.Options)) (*s3.GetObjectOutput, error)
 	ListObjectsV2(context.Context, *s3.ListObjectsV2Input, ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
 }
+type S3DeleteObjectAPI interface {
+	DeleteObject(context.Context, *s3.DeleteObjectInput, ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
+}
 
 // S3ObjectStore adapts an S3 bucket to DurableStore's ObjectStore interface.
 type S3ObjectStore struct {
@@ -231,6 +234,14 @@ func (s S3ObjectStore) List(ctx context.Context, prefix string) ([]string, error
 		}
 	}
 	return keys, nil
+}
+func (s S3ObjectStore) Delete(ctx context.Context, key string) error {
+	client, ok := s.Client.(S3DeleteObjectAPI)
+	if !ok {
+		return errors.New("S3 delete adapter is required for retention deletion")
+	}
+	_, err := client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(s.Bucket), Key: aws.String(s.key(key))})
+	return err
 }
 func (s S3ObjectStore) key(key string) string {
 	key = strings.TrimPrefix(key, "s3://"+s.Bucket+"/")

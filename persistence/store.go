@@ -25,6 +25,12 @@ type ObjectStore interface {
 	List(context.Context, string) ([]string, error)
 }
 
+// ObjectDeleter is deliberately separate from ObjectStore: recovery never
+// needs deletion rights, while retention workers must opt in explicitly.
+type ObjectDeleter interface {
+	Delete(context.Context, string) error
+}
+
 // HeadStore is the conditional accepted-head pointer used by DurableStore.
 type HeadStore interface {
 	Create(context.Context, evolution.AcceptedHead) error
@@ -79,19 +85,8 @@ func (s DurableStore) ListEvents(workspaceID string) ([]evolution.Event, error) 
 	if _, err := s.Heads.Get(context.Background(), workspaceID); err != nil {
 		return nil, err
 	}
-	keys, err := s.Objects.List(context.Background(), s.key("wal", workspaceID)+"/")
+	envelopes, _, err := s.recoveryEnvelopes(workspaceID)
 	if err != nil {
-		return nil, fmt.Errorf("list WAL records: %w", err)
-	}
-	envelopes := make([]evolution.EventEnvelope, 0, len(keys))
-	for _, key := range keys {
-		envelope, err := s.getEnvelopeKey(key)
-		if err != nil {
-			return nil, err
-		}
-		envelopes = append(envelopes, envelope)
-	}
-	if err := verifyChain(envelopes); err != nil {
 		return nil, err
 	}
 	events := make([]evolution.Event, 0, len(envelopes))
@@ -144,6 +139,16 @@ func (s DurableStore) GetCandidate(candidateID string) (evolution.Candidate, err
 	if err != nil {
 		return evolution.Candidate{}, err
 	}
+	if snapshot, err := s.latestCompactSnapshot(record.WorkspaceID, nil); err != nil {
+		return evolution.Candidate{}, err
+	} else if snapshot != nil {
+		for _, compacted := range snapshot.Candidates {
+			if compacted.ID == candidateID {
+				record = compacted
+				break
+			}
+		}
+	}
 	events, err := s.ListEvents(record.WorkspaceID)
 	if err != nil {
 		return evolution.Candidate{}, err
@@ -178,7 +183,13 @@ func (s DurableStore) GetHead(workspaceID string) (evolution.AcceptedHead, error
 		return head, err
 	}
 	if _, err := s.getEvent(workspaceID, head.EventID); err != nil {
-		return evolution.AcceptedHead{}, fmt.Errorf("accepted head WAL verification: %w", err)
+		snapshot, snapshotErr := s.latestSnapshotCandidate(workspaceID, head.EventID)
+		if snapshotErr != nil {
+			return evolution.AcceptedHead{}, snapshotErr
+		}
+		if snapshot == nil {
+			return evolution.AcceptedHead{}, fmt.Errorf("accepted head WAL verification: %w", err)
+		}
 	}
 	record, err := s.candidateForHead(head)
 	if err != nil {
@@ -322,7 +333,28 @@ func (s DurableStore) candidateForHead(head evolution.AcceptedHead) (candidateRe
 			return record, nil
 		}
 	}
+	if snapshot, err := s.latestCompactSnapshot(head.WorkspaceID, nil); err == nil && snapshot != nil {
+		for _, record := range snapshot.Candidates {
+			if record.EventID == head.EventID && record.SnapshotRef == head.SnapshotRef {
+				return record, nil
+			}
+		}
+	}
 	return candidateRecord{}, fmt.Errorf("%w: candidate for accepted head", evolution.ErrNotFound)
+}
+
+func (s DurableStore) latestSnapshotCandidate(workspace, eventID string) (*candidateRecord, error) {
+	snapshot, err := s.latestCompactSnapshot(workspace, nil)
+	if err != nil || snapshot == nil {
+		return nil, err
+	}
+	for _, record := range snapshot.Candidates {
+		if record.EventID == eventID {
+			copy := record
+			return &copy, nil
+		}
+	}
+	return nil, nil
 }
 
 func (s DurableStore) getCandidate(id string) (candidateRecord, error) {
@@ -383,23 +415,15 @@ func (s DurableStore) getJSON(key string, target any) error {
 	return nil
 }
 func (s DurableStore) chainTip(workspace string) (string, error) {
-	keys, err := s.Objects.List(context.Background(), s.key("wal", workspace)+"/")
+	envelopes, snapshot, err := s.recoveryEnvelopes(workspace)
 	if err != nil {
 		return "", err
 	}
-	if len(keys) == 0 {
-		return "", nil
-	}
-	envelopes := make([]evolution.EventEnvelope, 0, len(keys))
-	for _, key := range keys {
-		envelope, err := s.getEnvelopeKey(key)
-		if err != nil {
-			return "", err
+	if len(envelopes) == 0 {
+		if snapshot != nil {
+			return snapshot.ThroughHash, nil
 		}
-		envelopes = append(envelopes, envelope)
-	}
-	if err := verifyChain(envelopes); err != nil {
-		return "", err
+		return "", nil
 	}
 	parents := make(map[string]bool, len(envelopes))
 	for _, envelope := range envelopes {
@@ -538,4 +562,15 @@ func (m *MemoryObjects) List(_ context.Context, prefix string) ([]string, error)
 	}
 	sort.Strings(keys)
 	return keys, nil
+}
+
+func (m *MemoryObjects) Delete(_ context.Context, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.Values[key]; !ok {
+		return evolution.ErrNotFound
+	}
+	delete(m.Values, key)
+	delete(m.ContentTypes, key)
+	return nil
 }

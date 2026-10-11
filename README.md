@@ -168,6 +168,22 @@ The production promotion sequence is:
   `rsi-state cache-health --root <path>` inspects the cache and
   `cache-repair` removes corrupt entries. Set `RSI_STATE_CACHE_ROOT` to mount
   `GET /v1/cache/health` and `POST /v1/cache/repair` on the server.
+- `DurableStore.Compact` writes a SHA-256-verified recovery checkpoint,
+  records a signed `history.compacted` WAL event, and removes only WAL records
+  represented by that checkpoint. `Restore` loads the newest valid checkpoint
+  and replays its remaining WAL, preserving accepted-head history and audit
+  artifact references.
+- Retention classes are `accepted_revision` (indefinite),
+  `rejected_candidate`, `trajectory`, `log`, `raw_visual`, and `audit_event`.
+  `DurableStore.GarbageCollect` supports dry runs and refuses to delete an
+  expired rejected candidate while its records or artifacts are referenced by
+  an accepted head, compact manifest, or retained audit event. Configure
+  duration TTLs with `RSI_STATE_RETENTION_REJECTED_CANDIDATE_TTL`,
+  `RSI_STATE_RETENTION_TRAJECTORY_TTL`, `RSI_STATE_RETENTION_LOG_TTL`, and
+  `RSI_STATE_RETENTION_RAW_VISUAL_TTL`; set
+  `RSI_STATE_RETENTION_DRY_RUN=true` for reporting only.
+  `DurableStore.Metrics` reports replay depth, snapshot age, storage bytes,
+  and reclaimed bytes for metric exporters.
 
 `evolution.Keyring` seals Ed25519 envelopes and supports key rotation and
 revocation: revoked keys remain available to verify historical envelopes but

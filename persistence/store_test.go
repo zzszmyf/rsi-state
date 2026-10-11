@@ -218,6 +218,7 @@ func TestDurableStoreRejectsUnsignedAndReplayedWAL(t *testing.T) {
 	if _, err := store.CreateWorkspace("arc", now); err != nil {
 		t.Fatal(err)
 	}
+
 	if _, err := store.AppendEvent(evolution.EventInput{WorkspaceID: "arc", ParentRevision: 0, Kind: evolution.EventKindCandidateProposed, Actor: "evolver"}, now); !errors.Is(err, evolution.ErrInvalidInput) {
 		t.Fatalf("unsigned AppendEvent() error = %v", err)
 	}
@@ -236,6 +237,95 @@ func TestDurableStoreRejectsUnsignedAndReplayedWAL(t *testing.T) {
 	objects.Values[store.key("wal", "arc", "replay.json")] = append([]byte(nil), original...)
 	if _, err := store.ListEvents("arc"); !errors.Is(err, evolution.ErrInvalidInput) {
 		t.Fatalf("ListEvents() replay error = %v", err)
+	}
+}
+
+func TestCompactionRestoresEquivalentStateFromSnapshotAndRemainingWAL(t *testing.T) {
+	objects, heads := NewMemoryObjects(), newMemoryHeads()
+	store := DurableStore{Objects: objects, Heads: heads, Prefix: "rsi", Ledger: testLedger(t)}
+	now := time.Date(2026, 10, 11, 0, 0, 0, 0, time.UTC)
+	if _, err := store.CreateWorkspace("arc", now); err != nil {
+		t.Fatal(err)
+	}
+	candidate := createDurableCandidate(t, store, objects, "arc", "first", 0, now)
+	if _, err := store.PromoteCandidate("arc", candidate.ID, 0, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.Restore("arc", now.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.Compact("arc", now.Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.StateSHA256 == "" || snapshot.ObjectRef == "" {
+		t.Fatalf("unverified snapshot = %#v", snapshot)
+	}
+	restarted := DurableStore{Objects: objects, Heads: heads, Prefix: "rsi", Ledger: store.Ledger}
+	after, err := restarted.Restore("arc", now.Add(4*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.SnapshotUsed || after.ReplayDepth != 1 || after.Head != before.Head ||
+		len(after.Candidates) != len(before.Candidates) || after.Candidates[0].Status != evolution.CandidateAccepted {
+		t.Fatalf("recovered state = %#v, before = %#v", after, before)
+	}
+	events, err := restarted.ListEvents("arc")
+	if err != nil || len(events) != 1 || events[0].Kind != evolution.EventKindHistoryCompacted {
+		t.Fatalf("remaining WAL = %#v, %v", events, err)
+	}
+}
+
+func TestGarbageCollectionNeverDeletesAuditReferencedCandidate(t *testing.T) {
+	objects, heads := NewMemoryObjects(), newMemoryHeads()
+	store := DurableStore{Objects: objects, Heads: heads, Ledger: testLedger(t)}
+	now := time.Date(2026, 10, 11, 0, 0, 0, 0, time.UTC)
+	if _, err := store.CreateWorkspace("arc", now); err != nil {
+		t.Fatal(err)
+	}
+	candidate := createDurableCandidate(t, store, objects, "arc", "rejected", 0, now)
+	if _, err := store.RejectCandidate(candidate.ID, "holdout regression", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	report, err := store.GarbageCollect("arc", RetentionPolicy{RejectedCandidateTTL: time.Hour, DryRun: true}, now.Add(2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Eligible) != 0 || report.BytesReclaimable != 0 {
+		t.Fatalf("audit-referenced object offered for deletion: %#v", report)
+	}
+	if _, err := objects.Get(context.Background(), "bucket/snapshots/rejected"); err != nil {
+		t.Fatalf("referenced snapshot was deleted: %v", err)
+	}
+}
+
+func TestArtifactGCDryRunAndDeletionRespectReferences(t *testing.T) {
+	objects, heads := NewMemoryObjects(), newMemoryHeads()
+	store := DurableStore{Objects: objects, Heads: heads, Ledger: testLedger(t)}
+	now := time.Date(2026, 10, 11, 0, 0, 0, 0, time.UTC)
+	if _, err := store.CreateWorkspace("arc", now); err != nil {
+		t.Fatal(err)
+	}
+	key := "bucket/raw-visual/old-frame.png"
+	if err := objects.Put(context.Background(), key, []byte("frame"), "image/png"); err != nil {
+		t.Fatal(err)
+	}
+	inventory := []RetentionObject{{Key: key, Class: RetentionRawVisual, CreatedAt: now}}
+	policy := RetentionPolicy{RawVisualTTL: time.Hour, DryRun: true}
+	report, err := store.GarbageCollectObjects("arc", inventory, policy, now.Add(2*time.Hour))
+	if err != nil || len(report.Eligible) != 1 || len(report.Deleted) != 0 {
+		t.Fatalf("dry-run report = %#v, %v", report, err)
+	}
+	if _, err := objects.Get(context.Background(), key); err != nil {
+		t.Fatalf("dry-run deleted object: %v", err)
+	}
+	report, err = store.GarbageCollectObjects("arc", inventory, RetentionPolicy{RawVisualTTL: time.Hour}, now.Add(2*time.Hour))
+	if err != nil || len(report.Deleted) != 1 || report.BytesReclaimed != int64(len("frame")) {
+		t.Fatalf("delete report = %#v, %v", report, err)
+	}
+	if _, err := objects.Get(context.Background(), key); !errors.Is(err, evolution.ErrNotFound) {
+		t.Fatalf("expired object still exists: %v", err)
 	}
 }
 
